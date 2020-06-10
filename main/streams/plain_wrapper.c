@@ -181,7 +181,9 @@ static php_stream *_php_stream_fopen_from_fd_int(int fd, const char *mode, const
 	self->temp_name = NULL;
 	self->fd = fd;
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	// By default, the access is blocking (like it is in Linux). If the 'n' mode is present,
+	// we set the access as non-blocking.
+	self->is_pipe_blocking = strchr(mode, 'n') == NULL;
 #endif
 
 	return php_stream_alloc_rel(&php_stream_stdio_ops, self, persistent_id, mode);
@@ -201,7 +203,9 @@ static php_stream *_php_stream_fopen_from_file_int(FILE *file, const char *mode 
 	self->temp_name = NULL;
 	self->fd = fileno(file);
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	// By default, the access is blocking (like it is in Linux). If the 'n' mode is present,
+	// we set the access as non-blocking.
+	self->is_pipe_blocking = strchr(mode, 'n') == NULL;
 #endif
 
 	return php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
@@ -323,7 +327,9 @@ PHPAPI php_stream *_php_stream_fopen_from_pipe(FILE *file, const char *mode STRE
 	self->fd = fileno(file);
 	self->temp_name = NULL;
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	// By default, the access is blocking (like it is in Linux). If the 'n' mode is present,
+	// we set the access as non-blocking.
+	self->is_pipe_blocking = strchr(mode, 'n') == NULL;
 #endif
 
 	stream = php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
@@ -380,28 +386,22 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 
 	if (data->fd >= 0) {
 #ifdef PHP_WIN32
-		php_stdio_stream_data *self = (php_stdio_stream_data*)stream->abstract;
-
-		if ((self->is_pipe || self->is_process_pipe) && !self->is_pipe_blocking) {
+		// The following check is for (pseudo) non-blocking pipes. We check the amount 
+		// of data available in the pipe to avoid blocking on read:
+		//	- if avail_read is greather than 0, we read from the pipe (with avail_read 
+		//		or count, the smallest one)
+		//	- if avail_read is 0, it means there is no content, therefore calling read 
+		//		with 0 will not block
+		if ((data->is_pipe || data->is_process_pipe) && !data->is_pipe_blocking)
+		{
 			HANDLE ph = (HANDLE)_get_osfhandle(data->fd);
-			int retry = 0;
 			DWORD avail_read = 0;
 
-			do {
-				/* Look ahead to get the available data amount to read. Do the same
-					as read() does, however not blocking forever. In case it failed,
-					no data will be read (better than block). */
-				if (!PeekNamedPipe(ph, NULL, 0, NULL, &avail_read, NULL)) {
-					break;
-				}
-				/* If there's nothing to read, wait in 10ms periods. */
-				if (0 == avail_read) {
-					usleep(10);
-				}
-			} while (0 == avail_read && retry++ < 3200000);
+			// We ignore the return value...
+			PeekNamedPipe(ph, NULL, 0, NULL, &avail_read, NULL);
 
-			/* Reduce the required data amount to what is available, otherwise read()
-				will block.*/
+			// ...notice that avail_read can be lesser than count on PeekNamedPipe error, 
+			// so we are covered in that case too
 			if (avail_read < count) {
 				count = avail_read;
 			}
@@ -431,7 +431,29 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 				}
 			}
 		} else if (ret == 0) {
+#ifdef PHP_WIN32
+			if (data->is_pipe || data->is_process_pipe)
+			{
+				// If it is a blocking pipe, it means something went wrong, because the read call was
+				// a blocking operation, but it returned with 0 (no error... is it possible?)
+				if (data->is_pipe_blocking) {
+					stream->eof = 1;
+				} else {
+					// For (pseudo) non-blocking pipes, a 0 read means no data or an error, so we check
+					// the PeekNamedPipe result to know if we should mark eof for this non-blocking pipe
+					HANDLE ph = (HANDLE)_get_osfhandle(data->fd);
+					stream->eof = PeekNamedPipe(ph, NULL, 0, NULL, NULL, NULL) == FALSE ? 1 : 0;
+				}
+			}
+			else
+			{
+				// For non-pipe streams it remains as eof
+				stream->eof = 1;
+			}
+#elif
+			// Non-Win32
 			stream->eof = 1;
+#endif
 		}
 
 	} else {
@@ -658,6 +680,13 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 			if (-1 == fcntl(fd, F_SETFL, flags))
 				return -1;
 			return oldval;
+
+#elif defined(PHP_WIN32)
+			// We emulate non-blocking operations with this flag
+			int oldval = data->is_pipe_blocking;
+			data->is_pipe_blocking = value;
+			return oldval;
+
 #else
 			return -1; /* not yet implemented */
 #endif
@@ -908,9 +937,13 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 
 #ifdef PHP_WIN32
 		case PHP_STREAM_OPTION_PIPE_BLOCKING:
+			if (!data->is_pipe && !data->is_process_pipe)
+				return -1;
+
 			data->is_pipe_blocking = value;
 			return PHP_STREAM_OPTION_RETURN_OK;
 #endif
+
 		case PHP_STREAM_OPTION_META_DATA_API:
 			if (fd == -1)
 				return -1;
@@ -922,6 +955,14 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 			add_assoc_bool((zval*)ptrparam, "eof", stream->eof);
 
 			return PHP_STREAM_OPTION_RETURN_OK;
+
+#elif defined(PHP_WIN32)
+			add_assoc_bool((zval*)ptrparam, "timed_out", 0);
+			add_assoc_bool((zval*)ptrparam, "blocked", data->is_pipe_blocking ? 1 : 0);
+			add_assoc_bool((zval*)ptrparam, "eof", stream->eof);
+
+			return PHP_STREAM_OPTION_RETURN_OK;
+
 #endif
 			return -1;
 		default:
@@ -1104,6 +1145,10 @@ PHPAPI php_stream *_php_stream_fopen(const char *filename, const char *mode, zen
 				self->no_forced_fstat = 1;
 			}
 
+			// This has no effect within a ifNdef PHP_WIN32, I let it here just as a remainder and to make sure
+			// that is expected to always fopen as blocking unless the "n" flag is provided in the mode parameter
+			// and NO within the options and STREAM_USE_BLOCKING_PIPE.
+			// TODO: Remove this check all along, and remove the STREAM_USE_BLOCKING_PIPE flag
 			if (options & STREAM_USE_BLOCKING_PIPE) {
 				php_stdio_stream_data *self = (php_stdio_stream_data*)ret->abstract;
 				self->is_pipe_blocking = 1;

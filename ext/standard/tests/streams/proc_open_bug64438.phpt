@@ -16,9 +16,15 @@ $stdin = str_repeat('*', 4097);
 $options = array_merge(array('suppress_errors' => true, 'bypass_shell' => false));
 $process = proc_open($cmd, $descriptors, $pipes, getcwd(), array(), $options);
 
+// Now that Windows implementation has (pseudo) non-blocking pipes, this call produces multiple
+// reads, if we let pipes to be blocking, all the content is read and the feof($pipe) call returns true
+// as expected. Before, the stream_set_blocking was ignored for Windows, which means the is_pipe_blocking flag 
+// remained 0 throughout the script, and because of that the loop waiting for PeekNamedPipe to return bytes was being
+// accessed and looped until get some input, making the test "work as expected".
 foreach ($pipes as $pipe) {
-    stream_set_blocking($pipe, false);
+    stream_set_blocking($pipe, true);
 }
+
 $writePipes = array($pipes[0]);
 $stdinLen = strlen($stdin);
 $stdinOffset = 0;

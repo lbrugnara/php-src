@@ -502,7 +502,7 @@ PHP_FUNCTION(proc_open)
 	size_t tmp_len;
 	int suppress_errors = 0;
 	int bypass_shell = 0;
-	int blocking_pipes = 0;
+	int blocking_pipes = 1;	// Windows supports (pseudo) non-blocking pipes, starting them as blocking by default is the Linux behavior
 	int create_process_group = 0;
 	int create_new_console = 0;
 #else
@@ -588,8 +588,8 @@ PHP_FUNCTION(proc_open)
 
 		item = zend_hash_str_find(Z_ARRVAL_P(other_options), "blocking_pipes", sizeof("blocking_pipes") - 1);
 		if (item != NULL) {
-			if (Z_TYPE_P(item) == IS_TRUE || ((Z_TYPE_P(item) == IS_LONG) && Z_LVAL_P(item))) {
-				blocking_pipes = 1;
+			if (Z_TYPE_P(item) == IS_FALSE || ((Z_TYPE_P(item) == IS_LONG) && Z_LVAL_P(item) == 0)) {
+				blocking_pipes = 0;
 			}
 		}
 

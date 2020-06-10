@@ -17,7 +17,9 @@ if ($proc === false) {
 	print "something went wrong.\n";
 }
 var_dump($pipes);
-stream_set_blocking($pipes[1], FALSE);
+// With the added support of non-blocking pipes in Windows, this test must use
+// blocking pipes because stream_select is not supported yet
+stream_set_blocking($pipes[1], true);
 $test_string = "yay!\n";
 fwrite($pipes[0], $test_string);
 fflush($pipes[0]);
