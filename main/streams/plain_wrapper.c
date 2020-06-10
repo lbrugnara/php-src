@@ -450,7 +450,7 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 				// For non-pipe streams it remains as eof
 				stream->eof = 1;
 			}
-#elif
+#else
 			// Non-Win32
 			stream->eof = 1;
 #endif
