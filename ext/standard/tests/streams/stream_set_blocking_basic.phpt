@@ -1,9 +1,9 @@
 --TEST--
-stream_set_blocking should succeed pipes returned by proc_open
+stream_set_blocking call should return true on valid pipes returned by proc_open
 --FILE--
 <?php
 
-$ls = strstr(PHP_OS, "WIN") !== false ? "dir" : "ls";
+$ls = substr(PHP_OS, 0, 3) != 'WIN' !== false ? "dir" : "ls";
 $cmd = sprintf("%s", $ls);
 
 $desc = [ 0 => ["pipe", "r"], 1 => ["pipe", "w"], 2 => ["pipe", "w"] ];
@@ -24,7 +24,7 @@ var_dump(stream_set_blocking($pipes[2], true));
 proc_close($proc);
 
 ?>
---EXPECTF--
+--EXPECT--
 bool(true)
 bool(true)
 bool(true)
