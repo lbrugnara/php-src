@@ -50,7 +50,7 @@ do {
 	{
 		$output[1]['description'] = ($reads === 1
 			? "Read operation blocked on pipe 1" 
-			: "Read operation succeed after {$reads} non-blocking reads on pipe 2") . PHP_EOL;
+			: "Read operation succeed after {$reads} non-blocking reads on pipe 1") . PHP_EOL;
 		$output[1]['message'] = "Message content: " . $outmsg . PHP_EOL;
 		break;
 	}
@@ -78,6 +78,9 @@ do {
 
 	usleep(10000);
 } while (true);
+
+fclose($pipes[1]);
+fclose($pipes[2]);
 
 proc_close($proc);
 

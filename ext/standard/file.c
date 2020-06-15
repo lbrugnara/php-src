@@ -945,12 +945,19 @@ PHP_FUNCTION(popen)
 	posix_mode = estrndup(mode, mode_len);
 #ifndef PHP_WIN32
 	{
+		// Remove 'b' for *nixes
 		char *z = memchr(posix_mode, 'b', mode_len);
 		if (z) {
 			memmove(z, z + 1, mode_len - (z - posix_mode));
 		}
 	}
 #endif
+
+	// Remove non-blocking flag for all platforms
+	char *z = memchr(posix_mode, 'n', mode_len);
+	if (z) {
+		memmove(z, z + 1, mode_len - (z - posix_mode));
+	}
 
 	fp = VCWD_POPEN(command, posix_mode);
 	if (!fp) {

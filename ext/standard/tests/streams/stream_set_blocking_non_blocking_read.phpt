@@ -79,6 +79,9 @@ do {
 	usleep(10000);
 } while (true);
 
+fclose($pipes[1]);
+fclose($pipes[2]);
+
 proc_close($proc);
 
 echo $output[1]['description'];
