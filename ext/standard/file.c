@@ -972,6 +972,16 @@ PHP_FUNCTION(popen)
 		php_error_docref2(NULL, command, mode, E_WARNING, "%s", strerror(errno));
 		RETVAL_FALSE;
 	} else {
+#ifndef PHP_WIN32
+		// Make popen stream accept the non-blocking flag (default is blocking).
+		// NOTE: This check is for !defined(PHP_WIN32) because on Windows we handle
+		// the blocking state with a struct member and for *nixes we use the fcntl
+		// function, but the popen function passes the mode string directly to the 
+		// POSIX popen call, which doesn't support 'n'.
+		if (strchr(mode, 'n') != NULL) {
+			php_stream_set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+		}
+#endif
 		php_stream_to_zval(stream, return_value);
 	}
 

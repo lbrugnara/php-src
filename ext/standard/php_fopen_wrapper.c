@@ -422,6 +422,14 @@ php_stream * php_stream_url_wrap_php(php_stream_wrapper *wrapper, const char *pa
 			php_stream_set_option(stream, PHP_STREAM_OPTION_PIPE_BLOCKING, zval_get_long(blocking_pipes), NULL);
 		}
 	}
+#else
+	// Make stdin, stdout, and stderr accept the non-blocking flag (default is blocking).
+	// NOTE: This check is for !defined(PHP_WIN32) because on Windows we handle
+	// the blocking state with a struct member and for *nixes we use the fcntl
+	// function, but the PHP URL Wrapper seems to use a set of predefined mode flags
+	if (strchr(mode, 'n') != NULL) {
+		php_stream_set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+	}
 #endif
 	return stream;
 }
