@@ -4,6 +4,8 @@ Bug #60120 proc_open hangs with stdin/out with >2048 bytes
 <?php
 error_reporting(E_ALL);
 
+$path_key = substr(PHP_OS, 0, 3) == 'WIN' ? 'Path' : 'PATH';
+
 $file = preg_replace(
     "~\.phpt?$~", ".io.php", __FILE__);
 
@@ -30,7 +32,7 @@ $process = proc_open(
     ],
     $pipes,
     getcwd(),
-    [],
+    [ $path_key => $_ENV[$path_key] ],
     [
         'suppress_errors' => true, 
         'bypass_shell' => false

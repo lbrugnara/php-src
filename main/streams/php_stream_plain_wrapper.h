@@ -40,6 +40,11 @@ PHPAPI php_stream *_php_stream_fopen_from_fd(int fd, const char *mode, const cha
 PHPAPI php_stream *_php_stream_fopen_from_pipe(FILE *file, const char *mode STREAMS_DC);
 #define php_stream_fopen_from_pipe(file, mode)	_php_stream_fopen_from_pipe((file), (mode) STREAMS_CC)
 
+#ifdef PHP_WIN32
+PHPAPI php_stream *_php_stream_fopen_from_named_pipe(int fd, const char *mode STREAMS_DC);
+#define php_stream_fopen_from_named_pipe(fd, mode)	_php_stream_fopen_from_named_pipe((fd), (mode) STREAMS_CC)
+#endif
+
 PHPAPI php_stream *_php_stream_fopen_tmpfile(int dummy STREAMS_DC);
 #define php_stream_fopen_tmpfile()	_php_stream_fopen_tmpfile(0 STREAMS_CC)
 

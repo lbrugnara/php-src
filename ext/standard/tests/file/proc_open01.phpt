@@ -2,6 +2,9 @@
 proc_open() regression test 1 (proc_open() leak)
 --FILE--
 <?php
+
+$path_key = substr(PHP_OS, 0, 3) == 'WIN' ? 'Path' : 'PATH';
+
 $pipes = array(1, 2, 3);
 $orig_pipes = $pipes;
 $php = getenv('TEST_PHP_EXECUTABLE');
@@ -11,7 +14,7 @@ if ($php === false) {
 $proc = proc_open(
 	"$php -n",
 	array(0 => array('pipe', 'r'), 1 => array('pipe', 'w')),
-	$pipes, getcwd(), array(), array()
+	$pipes, getcwd(), array($path_key => $_ENV[$path_key]), array()
 );
 if ($proc === false) {
 	print "something went wrong.\n";

@@ -1,11 +1,5 @@
 --TEST--
 Bug #72853 (stream_set_blocking doesn't work)
---SKIPIF--
-<?php
-if(substr(PHP_OS, 0, 3) == 'WIN' ) {
-    die('skip not for windows');
-}
-?>
 --FILE--
 <?php
 

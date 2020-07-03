@@ -21,10 +21,10 @@ file_put_contents($fl, "<?php echo \"hello\", \"\n\"; ?>");
 $cmd = "$cgi -n -C $fl";
 
 /* Need to run CGI with the env reset. */
-$desc = array(0 => array("pipe", "r"));
-$proc = proc_open($cmd, $desc, $pipes, getcwd(), array());
+$desc = array(1 => array("pipe", "w"));
+$proc = proc_open($cmd, $desc, $pipes, getcwd(), [ 'Path' => $_ENV['Path'] ]);
 if (is_resource($proc)) {
-	echo stream_get_contents($pipes[0]);
+	echo stream_get_contents($pipes[1]);
 
 	proc_close($proc);
 }

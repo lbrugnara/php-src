@@ -555,7 +555,12 @@ PHP_FUNCTION(shell_exec)
 		RETURN_FALSE;
 	}
 
+#ifdef PHP_WIN32
+	/* The popen call uses 't', we need to flag the stream as 't' too */
+	stream = php_stream_fopen_from_pipe(in, "rt");
+#else
 	stream = php_stream_fopen_from_pipe(in, "rb");
+#endif
 	ret = php_stream_copy_to_mem(stream, PHP_STREAM_COPY_ALL, 0);
 	php_stream_close(stream);
 

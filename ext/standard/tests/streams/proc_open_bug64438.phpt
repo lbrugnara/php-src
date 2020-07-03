@@ -7,17 +7,19 @@ error_reporting(E_ALL);
 
 if (substr(PHP_OS, 0, 3) == 'WIN') {
 	$cmd = PHP_BINARY . ' -n -r "fwrite(STDOUT, $in = file_get_contents(\'php://stdin\')); fwrite(STDERR, $in);"';
+    $path_key = 'Path';
 } else {
 	$cmd = PHP_BINARY . ' -n -r \'fwrite(STDOUT, $in = file_get_contents("php://stdin")); fwrite(STDERR, $in);\'';
+    $path_key = 'PATH';
 }
 $descriptors = array(array('pipe', 'r'), array('pipe', 'w'), array('pipe', 'w'));
 $stdin = str_repeat('*', 4097);
 
 $options = array_merge(array('suppress_errors' => true, 'bypass_shell' => false));
-$process = proc_open($cmd, $descriptors, $pipes, getcwd(), array(), $options);
+$process = proc_open($cmd, $descriptors, $pipes, getcwd(), array( $path_key => $_ENV[$path_key] ), $options);
 
 foreach ($pipes as $pipe) {
-    stream_set_blocking($pipe, false);
+    stream_set_blocking($pipe, true);
 }
 $writePipes = array($pipes[0]);
 $stdinLen = strlen($stdin);

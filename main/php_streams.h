@@ -549,9 +549,6 @@ END_EXTERN_C()
 /* assume the path passed in exists and is fully expanded, avoiding syscalls */
 #define STREAM_ASSUME_REALPATH          0x00004000
 
-/* Allow blocking reads on anonymous pipes on Windows. */
-#define STREAM_USE_BLOCKING_PIPE        0x00008000
-
 /* Antique - no longer has meaning */
 #define IGNORE_URL_WIN 0
 

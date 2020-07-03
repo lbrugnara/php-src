@@ -3,6 +3,8 @@ Using proc_open() with a command array (no shell)
 --FILE--
 <?php
 
+$path_key = substr(PHP_OS, 0, 3) === 'WIN' ? 'Path' : 'PATH';
+
 $php = getenv('TEST_PHP_EXECUTABLE');
 $ds = [
     0 => ['pipe', 'r'],
@@ -25,7 +27,7 @@ fpassthru($pipes[1]);
 proc_close($proc);
 
 putenv('ENV_1=ENV_1');
-$env = ['ENV_2' => 'ENV_2'];
+$env = ['ENV_2' => 'ENV_2', $path_key => $_ENV[$path_key] ];
 $cmd = [$php, '-n', '-r', 'var_dump(getenv("ENV_1"), getenv("ENV_2"));'];
 
 echo "\nEnvironment inheritance:\n";

@@ -23,6 +23,7 @@
 #include "ext/standard/file.h"
 #include "ext/standard/flock_compat.h"
 #include "ext/standard/php_filestat.h"
+#include "Zend/zend_smart_string.h"
 #include <stddef.h>
 #include <fcntl.h>
 #if HAVE_SYS_WAIT_H
@@ -124,13 +125,24 @@ PHPAPI int php_stream_parse_fopen_modes(const char *mode, int *open_flags)
 typedef struct {
 	FILE *file;
 	int fd;					/* underlying file descriptor */
-	unsigned is_process_pipe:1;	/* use pclose instead of fclose */
-	unsigned is_pipe:1;		/* stream is an actual pipe, currently Windows only*/
+
+	unsigned is_popen_stream:1;	/* use pclose instead of fclose */
 	unsigned cached_fstat:1;	/* sb is valid */
-	unsigned is_pipe_blocking:1; /* allow blocking read() on pipes, currently Windows only */
 	unsigned no_forced_fstat:1;  /* Use fstat cache even if forced */
 	unsigned is_seekable:1;		/* don't try and seek, if not set */
-	unsigned _reserved:26;
+	unsigned is_pipe:1;		/* stream is an actual pipe */
+#ifdef PHP_WIN32
+	unsigned is_blocking:1; /* allow blocking read() on pipes */
+	unsigned is_named_pipe_server:1; /* A named pipe server needs to cleanup the pipe server */
+	unsigned pending_input:1; /* Flag to keep track of pending input after an overlapped operation */
+	unsigned pending_output:1; /* Flag to keep track of pending output after an overlapped operation */
+	unsigned _reserved:23;
+	LARGE_INTEGER file_pointer; /* Track the file pointer for both read and write operations */
+	OVERLAPPED overlapped_read; /* Overlapped struct for async read operations */
+	OVERLAPPED overlapped_write; /* Overlapped struct for async write operations */
+#elif
+	unsigned _reserved:27;
+#endif
 
 	int lock_flag;			/* stores the lock state */
 	zend_string *temp_name;	/* if non-null, this is the path to a temporary file that
@@ -177,11 +189,17 @@ static php_stream *_php_stream_fopen_from_fd_int(int fd, const char *mode, const
 	self->is_seekable = 1;
 	self->is_pipe = 0;
 	self->lock_flag = LOCK_UN;
-	self->is_process_pipe = 0;
+	self->is_popen_stream = 0;
 	self->temp_name = NULL;
 	self->fd = fd;
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	self->is_blocking = !self->is_pipe || strchr(mode, 'n') == NULL;
+	self->is_named_pipe_server = 0;
+	memset(&self->overlapped_read, 0, sizeof(OVERLAPPED));
+	memset(&self->overlapped_write, 0, sizeof(OVERLAPPED));
+	memset(&self->file_pointer, 0, sizeof(LARGE_INTEGER));
+	self->pending_input = 0;
+	self->pending_output = 0;
 #endif
 
 	return php_stream_alloc_rel(&php_stream_stdio_ops, self, persistent_id, mode);
@@ -197,11 +215,17 @@ static php_stream *_php_stream_fopen_from_file_int(FILE *file, const char *mode 
 	self->is_seekable = 1;
 	self->is_pipe = 0;
 	self->lock_flag = LOCK_UN;
-	self->is_process_pipe = 0;
+	self->is_popen_stream = 0;
 	self->temp_name = NULL;
 	self->fd = fileno(file);
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	self->is_blocking = !self->is_pipe || strchr(mode, 'n') == NULL;
+	self->is_named_pipe_server = 0;
+	memset(&self->overlapped_read, 0, sizeof(OVERLAPPED));
+	memset(&self->overlapped_write, 0, sizeof(OVERLAPPED));
+	memset(&self->file_pointer, 0, sizeof(LARGE_INTEGER));
+	self->pending_input = 0;
+	self->pending_output = 0;
 #endif
 
 	return php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
@@ -319,17 +343,97 @@ PHPAPI php_stream *_php_stream_fopen_from_pipe(FILE *file, const char *mode STRE
 	self->is_seekable = 0;
 	self->is_pipe = 1;
 	self->lock_flag = LOCK_UN;
-	self->is_process_pipe = 1;
+	self->is_popen_stream = 1;
 	self->fd = fileno(file);
 	self->temp_name = NULL;
 #ifdef PHP_WIN32
-	self->is_pipe_blocking = 0;
+	self->is_blocking = !self->is_pipe || strchr(mode, 'n') == NULL;
+	self->is_named_pipe_server = 0;
+	memset(&self->overlapped_read, 0, sizeof(OVERLAPPED));
+	memset(&self->overlapped_write, 0, sizeof(OVERLAPPED));
+	memset(&self->file_pointer, 0, sizeof(LARGE_INTEGER));
+	self->pending_input = 0;
+	self->pending_output = 0;
 #endif
 
 	stream = php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
 	stream->flags |= PHP_STREAM_FLAG_NO_SEEK;
 	return stream;
 }
+
+#ifdef PHP_WIN32
+
+PHPAPI php_stream *_php_stream_fopen_from_named_pipe(int fd, const char *mode STREAMS_DC)
+{
+	php_stdio_stream_data *self;
+	php_stream *stream;
+
+	self = emalloc_rel_orig(sizeof(*self));
+	memset(self, 0, sizeof(*self));
+	self->file = NULL;
+	self->is_seekable = 0;
+	self->is_pipe = 1;
+	self->lock_flag = LOCK_UN;
+	self->is_popen_stream = 0;
+	self->fd = fd;
+	self->temp_name = NULL;
+
+	self->is_blocking = !self->is_pipe || strchr(mode, 'n') == NULL; // If there is no 'n' arg present, it is blocking
+	self->is_named_pipe_server = 1;
+	memset(&self->overlapped_read, 0, sizeof(OVERLAPPED));
+	memset(&self->overlapped_write, 0, sizeof(OVERLAPPED));
+	memset(&self->file_pointer, 0, sizeof(LARGE_INTEGER));
+	self->pending_input = 0;
+	self->pending_output = 0;
+
+	stream = php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
+	stream->flags |= PHP_STREAM_FLAG_NO_SEEK;
+	return stream;
+}
+
+#define LINE_ENDING_CRNL	0
+#define LINE_ENDING_NL		1
+
+/*	This function inserts '\r' characters before every '\n' to emulate the win32 't' mode
+	for the fopen function. */
+static void translate_nl_to_crnl(const char *src, size_t count, smart_string *dest)
+{
+	assert(src != NULL);
+	assert(dest != NULL);
+
+	if (count == 0)
+		return;
+
+	for (size_t i=0; i < count; i++) {
+		if (src[i] == '\n') {
+			smart_string_appendc(dest, '\r');
+		}
+
+		smart_string_appendc(dest, src[i]);
+	}
+}
+
+/*	This function converts '\r\n' to '\n' when the 't' mode is enabled in the stream */
+static size_t translate_crnl_to_nl(char *src, size_t count)
+{
+	assert(src != NULL);
+
+	if (count == 0)
+		return 0;
+
+	size_t k = 0;
+	for (size_t i=0; i < count; i++) {
+		if (src[i] == '\r' && i < count - 1 && src[i+1] == '\n') {
+			continue;
+		}
+
+		src[k++] = src[i];
+	}
+
+	return k;
+}
+
+#endif
 
 static ssize_t php_stdiop_write(php_stream *stream, const char *buf, size_t count)
 {
@@ -339,14 +443,161 @@ static ssize_t php_stdiop_write(php_stream *stream, const char *buf, size_t coun
 
 	if (data->fd >= 0) {
 #ifdef PHP_WIN32
-		ssize_t bytes_written;
 		if (ZEND_SIZE_T_UINT_OVFL(count)) {
 			count = UINT_MAX;
 		}
-		bytes_written = _write(data->fd, buf, (unsigned int)count);
+
+		ssize_t bytes_written = 0;
+
+		/* 	Initially, the number of bytes to write is equals to count, but
+			it can change if the stream was opened with the 't' mode */
+		size_t bytes_to_write = count;
+
+		/* 	Emulate the 't' mode by translating NL to CRNL. Use a smart_string to hold the new representation.
+		   	TODO: Improve this */
+		smart_string str = { 0 }, *pstr = NULL;
+		if (strchr(stream->mode, 't') != NULL) {
+			translate_nl_to_crnl(buf, bytes_to_write, &str);
+			buf = str.c;
+			/* We update the number of bytes to write */
+			bytes_to_write = str.len;
+			pstr = &str;
+		}
+
+		HANDLE fhandle = (HANDLE)_get_osfhandle(data->fd);
+
+		/*	Update the file pointer for writing (base case) */
+		data->overlapped_write.Offset = data->file_pointer.LowPart;
+		data->overlapped_write.OffsetHigh = data->file_pointer.HighPart;
+
+		/*	Check special cases for the file pointer position */
+		if (strchr(stream->mode, 'a') != NULL) {
+			/*	If the stream was opened for append, we need to flag the overlapped struct accordingly:
+				https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile */
+			data->overlapped_write.Offset = 0xFFFFFFFF;
+			data->overlapped_write.OffsetHigh = 0xFFFFFFFF;
+		} else if (data->file) {
+			/*	TODO: Other stream operations might use a different set of functions (non-win32) so,
+				in the case zend_ftell returns a valid offset, we need to honor the previous usage. 
+				If not, we assume the overlapped struct is well-prepared to perform the write operation */
+			zend_off_t offset = zend_ftell(data->file);
+			if (offset >= 0) {
+				data->overlapped_write.Offset = (DWORD) offset;
+				data->overlapped_write.OffsetHigh = (DWORD) (offset >> sizeof(zend_off_t) / 2);
+			}
+		}
+
+		DWORD written = 0;
+		BOOL success = FALSE;
+		BOOL keep_trying = TRUE;
+
+		do {
+
+			/*	Async i/o makes things a little harder in win32, so we use a flag that tells us if there
+				is a pending output operation associated to this stream. */
+			if (!data->pending_output) {
+				/*	If the flag is false, we simply call WriteFile:
+					- If WriteFile returns TRUE it means the buffer has been written and the written variable
+					  should contain the written bytes
+					- if it returns FALSE, we let the switch below handle the situation */
+				success = WriteFile(fhandle, buf, (DWORD) bytes_to_write, &written, &data->overlapped_write);
+			} else {
+				/*	If the flag is true, it means we previously called WriteFile and it returned FALSE
+					and the GetLastError code in the switch was ERROR_IO_PENDING or ERROR_IO_INCOMPLETE,
+					which means we need to check the GetOverlappedResult to know if the pending I/O has finished.
+					If the function succeed, the buffer is populated with the incoming bytes, and the written 
+					variable will contain the written bytes, otherwise we need to check the GetLastError code to know 
+					if the I/O operations is still pending. 
+					The last parameter in the GetOverlappedResult function determines if this call blocks or not. 
+					We use the stream's is_blocking flag to properly handle this situation. */
+				success = GetOverlappedResult(fhandle, &data->overlapped_write, &written, data->is_blocking);
+			}
+
+			keep_trying = FALSE;
+
+			if (success) {
+				/*	Either if WriteFile succeed or GetOverlappedResult succeed, we need to reset the pending_output
+					flag, and we also need to update the file pointer and reset the overlapped object to use it agaian 
+					(if needed) in following calls to the write function */
+				data->pending_output = 0;
+				bytes_written = written;
+				memset(&data->overlapped_write, 0, sizeof(OVERLAPPED));
+				data->file_pointer.QuadPart += written;
+			} else {
+				/*	On error, we flag success as FALSE and we let the switch belowe handle the situation */
+				success = FALSE;
+				bytes_written = -1;
+
+				/*	This GetLastError call can return an error related to WriteFile or GetOverlappedResult, either way, it could
+					be a pending I/O for a non-blocking read, or another error */
+				DWORD last_error = GetLastError();
+				switch (last_error)
+				{
+					case ERROR_IO_PENDING:
+					case ERROR_IO_INCOMPLETE:
+						/*	We set the pending_output flag to 1, so the next call to the write function can check the
+							status of the pending operation using the GetOverlappedResult function */
+						data->pending_output = 1;
+						bytes_written = 0;
+						/* 	For blocking streams, we "keep trying": we iterate one more time to block on the GetOverlappedResult. 
+							For non-blocking streams, we stop iterating, and the following call to the write function handle the
+							async operation's result. */
+						keep_trying = data->is_blocking;
+						break;
+
+					case ERROR_BROKEN_PIPE:
+					case ERROR_HANDLE_EOF:
+						/* 	On EOF we flag the stream as such */
+						bytes_written = 0;
+						break;
+
+					case ERROR_ACCESS_DENIED:
+						/*	TODO: This particular condition works this way because many tests expect the errno error in order to pass */
+						bytes_written = -1;
+						_set_errno(EBADF);
+						php_error_docref(NULL, E_NOTICE, "write of %zu bytes failed with errno=%d %s", count, errno, strerror(errno));
+						break;
+
+					default:
+						/* 	Any other error is flaged as EOF and returns -1
+							TODO: Is it ok to flag it here? */
+						bytes_written = -1;
+						php_error_docref(NULL, E_NOTICE, "write of %zu bytes failed with GetLastError=%d", count, last_error);
+						break;
+				}
+			}
+		} while (keep_trying);
+
+		if (bytes_written == bytes_to_write) {
+			/* 	If the number of written bytes is equals to the number of bytes expected to be written
+				by this call, we can safely update it to prevent miscalculations with the emulated 't' mode */
+			bytes_written = count;
+		} else if (bytes_written > 0 && strchr(stream->mode, 't') != NULL) {
+			/* 	For the emulated 't' mode, if the number of bytes written by the async call is lesser than 
+				the expected one, we need to iterate through the buffer counting the number of '\r' inserted 
+				by us. */
+			size_t tmp = 0;
+			for (size_t i=0, j=0; i < (size_t) bytes_written; i++) {
+				if (pstr->c[i] == '\r' && buf[j] == '\n') {
+					/* 	If the smart_string contains a '\r' but the original buffer doesn't, it means
+						we added the '\r' char, so we ignore it for the count. */
+					continue;
+				}
+				tmp++;
+				j++;
+			}
+
+			bytes_written = tmp;
+		}
+
+		/* 	If the pointer to the smart string is not NULL we need to free it */
+		if (pstr) {
+			smart_string_free(pstr);
+		}
+
+		return bytes_written;
 #else
 		ssize_t bytes_written = write(data->fd, buf, count);
-#endif
 		if (bytes_written < 0) {
 			if (errno == EWOULDBLOCK || errno == EAGAIN) {
 				return 0;
@@ -358,6 +609,7 @@ static ssize_t php_stdiop_write(php_stream *stream, const char *buf, size_t coun
 			php_error_docref(NULL, E_NOTICE, "write of %zu bytes failed with errno=%d %s", count, errno, strerror(errno));
 		}
 		return bytes_written;
+#endif
 	} else {
 
 #if HAVE_FLUSHIO
@@ -379,34 +631,108 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 	assert(data != NULL);
 
 	if (data->fd >= 0) {
-#ifdef PHP_WIN32
-		php_stdio_stream_data *self = (php_stdio_stream_data*)stream->abstract;
+#ifdef PHP_WIN32		
 
-		if ((self->is_pipe || self->is_process_pipe) && !self->is_pipe_blocking) {
-			HANDLE ph = (HANDLE)_get_osfhandle(data->fd);
-			int retry = 0;
-			DWORD avail_read = 0;
+		HANDLE fhandle = (HANDLE)_get_osfhandle(data->fd);
 
-			do {
-				/* Look ahead to get the available data amount to read. Do the same
-					as read() does, however not blocking forever. In case it failed,
-					no data will be read (better than block). */
-				if (!PeekNamedPipe(ph, NULL, 0, NULL, &avail_read, NULL)) {
-					break;
-				}
-				/* If there's nothing to read, wait in 10ms periods. */
-				if (0 == avail_read) {
-					usleep(10);
-				}
-			} while (0 == avail_read && retry++ < 3200000);
+		/*	Update the file pointer for reading */
+		data->overlapped_read.Offset = data->file_pointer.LowPart;
+		data->overlapped_read.OffsetHigh = data->file_pointer.HighPart;
 
-			/* Reduce the required data amount to what is available, otherwise read()
-				will block.*/
-			if (avail_read < count) {
-				count = avail_read;
+		DWORD bytes_read = 0;
+		BOOL success = FALSE;
+		BOOL keep_trying = TRUE;
+
+		do {
+
+			/*	Async i/o makes thing a little harder in win32, so we use a flag that tells us if there
+				is a pending input operation associated to this stream. */
+			if (!data->pending_input) {
+				/*	If the flag is false, we simply call ReadFile:
+					- in case of success the buffer will be filled with the incoming bytes
+					  and the bytes_read variable should contain the read bytes
+					- if the function returns false, we let the switch below handle the situation */
+				success = ReadFile(fhandle, buf, (DWORD) count, &bytes_read, &data->overlapped_read);
+			} else {
+				/*	If the flag is true, it means we previously called ReadFile and it returned FALSE
+					and the GetLastError code in the switch was ERROR_IO_PENDING or ERROR_IO_INCOMPLETE,
+					which means we need to check the GetOverlappedResult to know if the pending I/O finished.
+					If this function call returns TRUE, the buffer has been populated with the incoming
+					bytes, and the bytes_read property contains the read bytes, otherwise we need
+					to check the GetLastError code to know if the I/O operations is still pending.
+					The last parameter in the GetOverlappedResult function determines if this call blocks or not. 
+					We use the stream's is_blocking flag to properly handle this situation. 
+					NOTE: The buf object is populated asynchronously by the thread performing the I/O operation,
+					it might generate conflicts with the stream internal state in some situations, it could probably
+					be better to use a temporal buffer and then just memcpy it to the stream's buffer */
+				success = GetOverlappedResult(fhandle, &data->overlapped_read, &bytes_read, data->is_blocking);
 			}
+
+			keep_trying = FALSE;
+
+			if (success) {
+				/*	Either if ReadFile succeed or GetOverlappedResult succeed, we need to reset the pending_input
+					flag, and therefore we need to "update" the overlapped object to use it agaian (if needed) in 
+					following calls to the read function */
+				data->pending_input = 0;
+				ret = bytes_read;
+				memset(&data->overlapped_read, 0, sizeof(OVERLAPPED));
+				data->file_pointer.QuadPart += bytes_read;
+			} else {
+				/*	On error, we flag success as FALSE and we let the switch belowe handle the situation */
+				success = FALSE;
+				ret = -1;
+
+				/*	This GetLastError call can return an error related to ReadFile or GetOverlappedResult, either way, it could
+					be a pending I/O for a non-blocking read, or another error */
+				DWORD last_error = GetLastError();
+				switch (last_error)
+				{
+					case ERROR_IO_PENDING:
+					case ERROR_IO_INCOMPLETE:
+						/*	We set the pending_input flag to 1, so the next call to the read function can check the
+							status of the pending operation using the GetOverlappedResult function */
+						data->pending_input = 1;
+						ret = 0;
+						/* 	For blocking streams, we "keep trying": we iterate one more time to block on the GetOverlappedResult. 
+							For non-blocking streams, we stop iterating, and the following call to the read function handle the
+							async operation's result. */
+						keep_trying = data->is_blocking;
+						break;
+
+					case ERROR_BROKEN_PIPE:
+					case ERROR_HANDLE_EOF:
+						/*	On EOF we flag the stream as such */
+						ret = 0;
+						stream->eof = 1;
+						break;
+
+					case ERROR_ACCESS_DENIED:
+						ret = -1;
+						/*	TODO: This particular condition works this way because many tests expect the errno error in order to pass */
+						_set_errno(EBADF);
+						php_error_docref(NULL, E_NOTICE, "read of %zu bytes failed with errno=%d %s", count, errno, strerror(errno));
+						break;
+
+					default:
+						/* 	Any other error is flaged as EOF and returns -1
+							TODO: Is it ok to flag it here? */
+						ret = -1;
+						stream->eof = 1;
+						php_error_docref(NULL, E_NOTICE, "read of %zu bytes failed with GetLastError=%d", count, last_error);
+						break;
+				}
+			}
+		} while (keep_trying);
+
+		/* 	If the stream was opened with the 't' mode, we need to emulate the conversion of the
+			sequence '\r\n' to '\n' */
+		if (ret > 0 && strchr(stream->mode, 't') != NULL) {
+			/*	Update the number of bytes read */
+			ret = translate_crnl_to_nl(buf, ret);
 		}
-#endif
+
+#else
 		ret = read(data->fd, buf,  PLAIN_WRAP_BUF_SIZE(count));
 
 		if (ret == (size_t)-1 && errno == EINTR) {
@@ -433,6 +759,7 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 		} else if (ret == 0) {
 			stream->eof = 1;
 		}
+#endif		
 
 	} else {
 #if HAVE_FLUSHIO
@@ -473,7 +800,7 @@ static int php_stdiop_close(php_stream *stream, int close_handle)
 
 	if (close_handle) {
 		if (data->file) {
-			if (data->is_process_pipe) {
+			if (data->is_popen_stream) {
 				errno = 0;
 				ret = pclose(data->file);
 
@@ -487,6 +814,32 @@ static int php_stdiop_close(php_stream *stream, int close_handle)
 				data->file = NULL;
 			}
 		} else if (data->fd != -1) {
+#ifdef PHP_WIN32
+			if (data->is_pipe) {
+				HANDLE pipe_handle = (HANDLE)_get_osfhandle(data->fd);
+
+				if (data->is_blocking) {
+					/*	Flush happens only for blocking streams because it could hang */
+					size_t mode_length = strlen(stream->mode);
+					for (size_t i=0; i < mode_length; i++) {
+						char mode = stream->mode[i];
+						/*	This end of the pipe must be for writing */
+						if (mode == '+' || mode == 'w' || mode == 'a' || mode == 'x' || mode == 'c') {
+							/*	NOTE: This call will hang waiting for the client to read all the written content, it could be not desired
+								to block on fclose */
+							FlushFileBuffers(pipe_handle);
+							break;
+						}
+					}
+				}				
+
+				/*	We destroy the pipe server on close
+					https://docs.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe?redirectedfrom=MSDN */
+				if (data->is_named_pipe_server) {
+					DisconnectNamedPipe(pipe_handle);
+				}
+			}
+#endif
 			ret = close(data->fd);
 			data->fd = -1;
 		} else {
@@ -533,7 +886,7 @@ static int php_stdiop_flush(php_stream *stream)
 static int php_stdiop_seek(php_stream *stream, zend_off_t offset, int whence, zend_off_t *newoffset)
 {
 	php_stdio_stream_data *data = (php_stdio_stream_data*)stream->abstract;
-	int ret;
+	int ret = -1;
 
 	assert(data != NULL);
 
@@ -541,6 +894,23 @@ static int php_stdiop_seek(php_stream *stream, zend_off_t offset, int whence, ze
 		php_error_docref(NULL, E_WARNING, "cannot seek on this stream");
 		return -1;
 	}
+
+#ifdef PHP_WIN32
+	if (data->fd >= 0) {
+		HANDLE hFile = (HANDLE) _get_osfhandle(data->fd);
+
+		LARGE_INTEGER distanceToMove = { 0 };
+		distanceToMove.QuadPart = (LONGLONG) offset;
+
+		if(!SetFilePointerEx(hFile, distanceToMove, &data->file_pointer, (DWORD) whence))
+			return -1;
+
+		*newoffset = (zend_off_t) data->file_pointer.QuadPart;
+		ret = 0;
+	}
+
+	return ret;
+#else
 
 	if (data->fd >= 0) {
 		zend_off_t result;
@@ -557,6 +927,8 @@ static int php_stdiop_seek(php_stream *stream, zend_off_t offset, int whence, ze
 		*newoffset = zend_ftell(data->file);
 		return ret;
 	}
+
+#endif
 }
 
 static int php_stdiop_cast(php_stream *stream, int castas, void **ret)
@@ -657,6 +1029,14 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 
 			if (-1 == fcntl(fd, F_SETFL, flags))
 				return -1;
+			return oldval;
+			
+#elif defined(PHP_WIN32)
+			/*	We use the is_blocking flag to wait or not for async operations
+				on read and write calls */
+			int oldval = data->is_blocking;
+			data->is_blocking = value;
+
 			return oldval;
 #else
 			return -1; /* not yet implemented */
@@ -908,7 +1288,11 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 
 #ifdef PHP_WIN32
 		case PHP_STREAM_OPTION_PIPE_BLOCKING:
-			data->is_pipe_blocking = value;
+			if (!data->is_pipe)
+				return -1;
+
+			data->is_blocking = value;
+
 			return PHP_STREAM_OPTION_RETURN_OK;
 #endif
 		case PHP_STREAM_OPTION_META_DATA_API:
@@ -922,6 +1306,14 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 			add_assoc_bool((zval*)ptrparam, "eof", stream->eof);
 
 			return PHP_STREAM_OPTION_RETURN_OK;
+
+#elif defined(PHP_WIN32)
+			add_assoc_bool((zval*)ptrparam, "timed_out", 0);
+			add_assoc_bool((zval*)ptrparam, "blocked", data->is_blocking ? 1 : 0);
+			add_assoc_bool((zval*)ptrparam, "eof", stream->eof);
+
+			return PHP_STREAM_OPTION_RETURN_OK;
+
 #endif
 			return -1;
 		default:
@@ -1102,11 +1494,6 @@ PHPAPI php_stream *_php_stream_fopen(const char *filename, const char *mode, zen
 				/* Make sure the fstat result is reused when we later try to get the
 				 * file size. */
 				self->no_forced_fstat = 1;
-			}
-
-			if (options & STREAM_USE_BLOCKING_PIPE) {
-				php_stdio_stream_data *self = (php_stdio_stream_data*)ret->abstract;
-				self->is_pipe_blocking = 1;
 			}
 #endif
 

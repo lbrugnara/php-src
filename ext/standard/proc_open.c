@@ -35,6 +35,7 @@
 #include "SAPI.h"
 #include "main/php_network.h"
 #include "zend_smart_string.h"
+#include "php_lcg.h"
 
 #if HAVE_SYS_WAIT_H
 #include <sys/wait.h>
@@ -46,6 +47,19 @@
 #endif
 #if HAVE_FCNTL_H
 #include <fcntl.h>
+#endif
+
+#ifdef PHP_WIN32
+#include "win32/time.h"
+#else
+#include <sys/time.h>
+#endif
+
+#ifdef PHP_WIN32
+/* NOTE: 64k, is it ok? */
+#define PIPE_BUFFER_SIZE 65536
+#define PIPE_MAX_INSTANCE 1
+ZEND_TLS struct timeval prev_tv = { 0, 0 };
 #endif
 
 /* This symbol is defined in ext/standard/config.m4.
@@ -502,7 +516,7 @@ PHP_FUNCTION(proc_open)
 	size_t tmp_len;
 	int suppress_errors = 0;
 	int bypass_shell = 0;
-	int blocking_pipes = 0;
+	int blocking_pipes = 1; /*	NOTE: default is blocking mode (BC) */
 	int create_process_group = 0;
 	int create_new_console = 0;
 #else
@@ -588,8 +602,8 @@ PHP_FUNCTION(proc_open)
 
 		item = zend_hash_str_find(Z_ARRVAL_P(other_options), "blocking_pipes", sizeof("blocking_pipes") - 1);
 		if (item != NULL) {
-			if (Z_TYPE_P(item) == IS_TRUE || ((Z_TYPE_P(item) == IS_LONG) && Z_LVAL_P(item))) {
-				blocking_pipes = 1;
+			if (Z_TYPE_P(item) == IS_FALSE || ((Z_TYPE_P(item) == IS_LONG) && Z_LVAL_P(item) == 0)) {
+				blocking_pipes = 0;
 			}
 		}
 
@@ -625,6 +639,21 @@ PHP_FUNCTION(proc_open)
 	security.nLength = sizeof(security);
 	security.bInheritHandle = TRUE;
 	security.lpSecurityDescriptor = NULL;
+	
+	/*	The UUID implementation has been taken from the uniqid function */
+	char pipe_unique_name[32];
+	struct timeval tv;
+	do {
+		(void)gettimeofday((struct timeval *) &tv, (struct timezone *) NULL);
+	} while (tv.tv_sec == prev_tv.tv_sec && tv.tv_usec == prev_tv.tv_usec);
+
+	prev_tv.tv_sec = tv.tv_sec;
+	prev_tv.tv_usec = tv.tv_usec;
+
+	int sec = (int) tv.tv_sec;
+	int usec = (int) (tv.tv_usec % 0x100000);
+
+	snprintf(pipe_unique_name, 32, "%08x%05x%.8F", sec, usec, php_combined_lcg() * 10);
 #endif
 
 	/* walk the descriptor spec and set up files/pipes */
@@ -693,6 +722,7 @@ PHP_FUNCTION(proc_open)
 
 				descriptors[ndesc].mode = DESC_PIPE;
 
+#ifndef PHP_WIN32
 				if (0 != pipe(newpipe)) {
 					php_error_docref(NULL, E_WARNING, "unable to create pipe %s", strerror(errno));
 					goto exit_fail;
@@ -706,15 +736,61 @@ PHP_FUNCTION(proc_open)
 					descriptors[ndesc].parentend = newpipe[0];
 					descriptors[ndesc].childend = newpipe[1];
 				}
-#ifdef PHP_WIN32
-				/* don't let the child inherit the parent side of the pipe */
-				descriptors[ndesc].parentend = dup_handle(descriptors[ndesc].parentend, FALSE, TRUE);
-#endif
-				descriptors[ndesc].mode_flags = descriptors[ndesc].mode & DESC_PARENT_MODE_WRITE ? O_WRONLY : O_RDONLY;
-#ifdef PHP_WIN32
+#else
+				/*	If the parameter is [ "pipe", "w" ], the child will use the pipe for writing */
+				int client_writes = strncmp(Z_STRVAL_P(zmode), "w", 1) >= 0;
+
+				/*	The pipe server is viewed from the parent perspective, so it is an
+					"inbound" server for a child process with [ "pipe", "w" ], and an "outbound"
+					server for a child process with [ "pipe", "r" ] */
+				char *pipe_instance_name = client_writes ? "in" : "out";
+				
+				/*	The pipe name uses the unique id generated above with the particular name for the
+					instance (in or out) and the descriptor's index */
+				char pipe_name[255] = { 0 };
+				snprintf(pipe_name, 255, "\\\\.\\pipe\\%s.%d.%s", pipe_unique_name, nindex, pipe_instance_name);
+
+				/*	Default server open modes are:
+					- FILE_FLAG_OVERLAPPED: for async io
+					- FILE_FLAG_FIRST_PIPE_INSTANCE: Deny access for another CreateNamedPipe instance with the same name */
+				DWORD server_open_mode = FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE;
+
+				/*	Default server pipe modes are:
+					- PIPE_TYPE_BYTE: The pipe is a stream of bytes
+					- PIPE_REJECT_REMOTE_CLIENTS: The named pipe is only accessible by the executing machine */
+				DWORD server_pipe_mode = PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS;
+				DWORD client_open_mode = FILE_READ_ATTRIBUTES;
+
+				HANDLE pipe_server = NULL;
+				HANDLE pipe_client = NULL;
+
+				/*	https://docs.microsoft.com/en-us/windows/win32/ipc/named-pipe-open-modes */
+				if (client_writes) {
+					/*	Make one end of the pipe read-only for the server (parent process) and 
+						the other one write-only for the client (child process) */
+					server_open_mode |= PIPE_ACCESS_INBOUND;
+					client_open_mode = GENERIC_WRITE;
+				} else {
+					/*	Parent writes, and child reads */
+					server_open_mode |= PIPE_ACCESS_OUTBOUND;
+					client_open_mode = GENERIC_READ;
+					descriptors[ndesc].mode |= DESC_PARENT_MODE_WRITE;
+				}
+
+				/*	Create the pipe server (for the parent) */
+				pipe_server = CreateNamedPipeA(pipe_name, server_open_mode, server_pipe_mode, PIPE_MAX_INSTANCE, PIPE_BUFFER_SIZE, PIPE_BUFFER_SIZE, 0, &security);
+
+				/*	Open the pipe file (for the child process) */
+				pipe_client = CreateFile(pipe_name, client_open_mode, 0, &security, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+
+				descriptors[ndesc].parentend = pipe_server;
+				descriptors[ndesc].childend = pipe_client;
+				
 				if (Z_STRLEN_P(zmode) >= 2 && Z_STRVAL_P(zmode)[1] == 'b')
 					descriptors[ndesc].mode_flags |= O_BINARY;
 #endif
+
+				descriptors[ndesc].mode_flags = descriptors[ndesc].mode & DESC_PARENT_MODE_WRITE ? O_WRONLY : O_RDONLY;
 
 			} else if (strcmp(Z_STRVAL_P(ztype), "file") == 0) {
 				zval *zfile, *zmode;
@@ -1138,8 +1214,8 @@ PHP_FUNCTION(proc_open)
 						break;
 				}
 #ifdef PHP_WIN32
-				stream = php_stream_fopen_from_fd(_open_osfhandle((zend_intptr_t)descriptors[i].parentend,
-							descriptors[i].mode_flags), mode_string, NULL);
+				stream = php_stream_fopen_from_named_pipe(_open_osfhandle((zend_intptr_t)descriptors[i].parentend,
+							descriptors[i].mode_flags), mode_string);
 				php_stream_set_option(stream, PHP_STREAM_OPTION_PIPE_BLOCKING, blocking_pipes, NULL);
 #else
 				stream = php_stream_fopen_from_fd(descriptors[i].parentend, mode_string, NULL);
